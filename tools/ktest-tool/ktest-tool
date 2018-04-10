@@ -59,7 +59,26 @@ class KTest:
         # Augment with extra filename field
         b.filename = path
         return b
-    
+
+    def tofile(self, path):
+        f = open(path, 'wb')
+        f.write('KTEST')
+        f.write(struct.pack('>i', version_no))
+        f.write(struct.pack('>i', len(self.args))) 
+        for a in self.args:
+            f.write(struct.pack('>i', len(a)))
+            f.write(a.encode(encoding='ascii'))
+
+        f.write(struct.pack('>i', self.symArgvs))
+        f.write(struct.pack('>i', self.symArgvLen))
+        f.write(struct.pack('>i', len(self.objects)))
+        for (objectname,objectbytes) in self.objects:
+            f.write(struct.pack('>i', len(objectname)))
+            f.write(objectname.encode(encoding='ascii'))
+            f.write(struct.pack('>i', len(objectbytes)))
+            f.write(objectbytes)
+        f.close()
+
     def __init__(self, version, args, symArgvs, symArgvLen, objects):
         self.version = version
         self.symArgvs = symArgvs
