@@ -95,46 +95,59 @@ class KTest:
           program_name = program_name[:-3]
         self.programName = program_name
         
-def trimZeros(str):
-    for i in range(len(str))[::-1]:
-        if str[i] != '\x00':
-            return str[:i+1]
+def trimZeros(s):
+    for i in range(len(s))[::-1]:
+        if s[i] != '\x00':
+            return s[:i+1]
     return ''
     
 def main(args):
-    from optparse import OptionParser
-    op = OptionParser("usage: %prog [options] files")
-    op.add_option('','--trim-zeros', dest='trimZeros', action='store_true', 
-                  default=False,
-                  help='trim trailing zeros')
-    op.add_option('','--write-ints', dest='writeInts', action='store_true',
-                  default=False,
-                  help='convert 4-byte sequences to integers')
-    
-    opts,args = op.parse_args()
+    from argparse import ArgumentParser
+    parser = ArgumentParser('ktest-tool')
+    parser.add_argument('--trim-zeros', dest='trimZeros', action='store_true', 
+                        default=False,
+                        help='trim trailing zeros')
+    parser.add_argument('--write-ints', dest='writeInts', action='store_true',
+                        default=False,
+                        help='convert 4-byte sequences to integers')
+    parser.add_argument('--create-new-file', dest='createNewFile', 
+                        action='store_true', default=False,
+                        help="create new ktest file from scratch")
+    parser.add_argument('--ktest-arg', action='append', dest='arg')
+    parser.add_argument('--ktest-object-name', action='append', dest='oname')
+    parser.add_argument('--ktest-object-data', action='append', dest='odata')
+    parser.add_argument('--ktest-symbolic-argv', type=int, default=0, dest='sargv')
+    parser.add_argument('--ktest-symbolic-argv-len', type=int, default=0, dest='sargvlen')
+    parser.add_argument('files', action='append')
+    args = parser.parse_args()
     if not args:
         op.error("incorrect number of arguments")
 
-    for file in args:
-        b = KTest.fromfile(file)
-        pos = 0
-        print('ktest file : %r' % file)
-        print('args       : %r' % b.args)
-        print('num objects: %r' % len(b.objects))
-        for i,(name,data) in enumerate(b.objects):
-            if opts.trimZeros:
-                str = trimZeros(data)
-            else:
-                str = data
+    if args.createNewFile:
+        objects = zip(args.oname, [open(b, 'rb').read() for b in args.odata])
+        b = KTest(version_no, args.arg, args.sargv, args.sargvlen, objects)
+        b.tofile(args.files[0])
+    else:
+        for f in args.files:
+            b = KTest.fromfile(f)
+            pos = 0
+            print('ktest file : %r' % f)
+            print('args       : %r' % b.args)
+            print('num objects: %r' % len(b.objects))
+            for i,(name,data) in enumerate(b.objects):
+                if args.trimZeros:
+                    str = trimZeros(data)
+                else:
+                    str = data
 
-            print('object %4d: name: %r' % (i, name))
-            print('object %4d: size: %r' % (i, len(data)))
-            if opts.writeInts and len(data) == 4: 
-                print('object %4d: data: %r' % (i, struct.unpack('i',str)[0]))
-            else:
-                print('object %4d: data: %r' % (i, str))
-        if file != args[-1]:
-            print()
+                print('object %4d: name: %r' % (i, name))
+                print('object %4d: size: %r' % (i, len(data)))
+                if args.writeInts and len(data) == 4: 
+                    print('object %4d: data: %r' % (i, struct.unpack('i',str)[0]))
+                else:
+                    print('object %4d: data: %r' % (i, str))
+            if f != args.files[-1]:
+                print()
 
 if __name__=='__main__':
     main(sys.argv)
