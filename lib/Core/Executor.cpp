@@ -1304,10 +1304,18 @@ void Executor::executeCall(ExecutionState &state,
           //
           // Alignment requirements for scalar types is the same as their size
           if (argWidth > Expr::Int64) {
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 9)
+             size = llvm::alignTo(size, 16);
+#else
              size = llvm::RoundUpToAlignment(size, 16);
+#endif
              requires16ByteAlignment = true;
           }
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 9)
+          size += llvm::alignTo(argWidth, WordSize) / 8;
+#else
           size += llvm::RoundUpToAlignment(argWidth, WordSize) / 8;
+#endif
         }
       }
 
@@ -1340,10 +1348,18 @@ void Executor::executeCall(ExecutionState &state,
 
             Expr::Width argWidth = arguments[i]->getWidth();
             if (argWidth > Expr::Int64) {
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 9)
+              offset = llvm::alignTo(offset, 16);
+#else
               offset = llvm::RoundUpToAlignment(offset, 16);
+#endif
             }
             os->write(offset, arguments[i]);
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 9)
+            offset += llvm::alignTo(argWidth, WordSize) / 8;
+#else
             offset += llvm::RoundUpToAlignment(argWidth, WordSize) / 8;
+#endif
           }
         }
       }
@@ -2209,8 +2225,13 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         !fpWidthToSemantics(right->getWidth()))
       return terminateStateOnExecError(state, "Unsupported FRem operation");
     llvm::APFloat Res(*fpWidthToSemantics(left->getWidth()), left->getAPValue());
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 8)
+    Res.mod(
+        APFloat(*fpWidthToSemantics(right->getWidth()), right->getAPValue()));
+#else
     Res.mod(APFloat(*fpWidthToSemantics(right->getWidth()),right->getAPValue()),
             APFloat::rmNearestTiesToEven);
+#endif
     bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
     break;
   }
