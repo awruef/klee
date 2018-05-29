@@ -5,7 +5,7 @@ MAINTAINER Dan Liew <daniel.liew@imperial.ac.uk>
 # squash the layers from within a Dockerfile so
 # the resulting image is unnecessarily large!
 
-ENV LLVM_VERSION=3.4 \
+ENV LLVM_VERSION=3.8 \
     SOLVERS=STP:Z3 \
     STP_VERSION=2.1.2 \
     DISABLE_ASSERTIONS=0 \
@@ -31,6 +31,9 @@ RUN apt-get update && \
         cmake \
         make \
         libboost-program-options-dev \
+        python2.7 \
+        python2.7-dev \
+        python-pip \
         python3 \
         python3-dev \
         python3-pip \
@@ -42,6 +45,9 @@ RUN apt-get update && \
         patch \
         wget \
         unzip \
+        build-essential \ 
+        gcc \ 
+        g++ \ 
         binutils && \
     pip3 install -U lit tabulate wllvm && \
     update-alternatives --install /usr/bin/python python /usr/bin/python3 50 && \
@@ -76,8 +82,8 @@ RUN cd ${BUILD_DIR} && mkdir test-utils && cd test-utils && \
     ${KLEE_SRC}/.travis/testing-utils.sh
 
 # FIXME: The current TravisCI script expects clang-${LLVM_VERSION} to exist
-RUN sudo ln -s /usr/bin/clang /usr/bin/clang-${LLVM_VERSION} && \
-    sudo ln -s /usr/bin/clang++ /usr/bin/clang++-${LLVM_VERSION}
+#RUN sudo ln -s /usr/bin/clang /usr/bin/clang-${LLVM_VERSION} && \
+#    sudo ln -s /usr/bin/clang++ /usr/bin/clang++-${LLVM_VERSION}
 
 # Build KLEE (use TravisCI script)
 RUN cd ${BUILD_DIR} && ${KLEE_SRC}/.travis/klee.sh

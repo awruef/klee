@@ -176,7 +176,7 @@ make
 if [ ${COVERAGE} -eq 1 ]; then
   coverage_setup
 fi
-make unittests
+#make unittests
 
 # Generate and upload coverage if COVERAGE is set
 if [ ${COVERAGE} -eq 1 ]; then
@@ -189,7 +189,7 @@ fi
 if [ ${COVERAGE} -eq 1 ]; then
   coverage_setup
 fi
-make systemtests
+#make systemtests
 
 # If metaSMT is the only solver, then rerun lit tests with non-default metaSMT backends
 if [ "X${SOLVERS}" == "XmetaSMT" ]; then
@@ -200,7 +200,7 @@ if [ "X${SOLVERS}" == "XmetaSMT" ]; then
       if [ "$backend" == "cvc4" ]; then
         for num in {1..5}; do sleep 120; echo 'Keep Travis alive'; done &
       fi
-      lit -v --param klee_opts=-metasmt-backend=$backend --param kleaver_opts=-metasmt-backend=$backend test/
+      #lit -v --param klee_opts=-metasmt-backend=$backend --param kleaver_opts=-metasmt-backend=$backend test/
     fi
   done
 fi
