@@ -11,7 +11,7 @@ if [[ "${DOCKER_BUILD}x" == "1x" ]]; then
 fi
 if [[ "${KLEE_TRAVIS_BUILD}x" != "1x" ]]; then
 : "${REPOSITORY:=klee}"
-: "${LLVM_VERSION:=3.4}"
+: "${LLVM_VERSION:=3.8}"
 : "${DISABLE_ASSERTIONS:=0}"
 : "${ENABLE_DEBUG:=1}"
 : "${ENABLE_OPTIMIZED:=1}"
