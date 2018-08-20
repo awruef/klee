@@ -1,0 +1,53 @@
+#!/usr/bin/env python2.7
+from argparse import ArgumentParser
+from tempfile import mkstemp,mkdtemp
+from subprocess import check_call
+import shutil
+import os
+import sys
+
+def main(args):
+    concrete_size = os.path.getsize(args.inputfile)
+    ktest_cmd = ["ktest-tool"]
+    ktest_cmd.append("--create-new-file")
+    ktest_cmd.append("--ktest-arg={}".format(args.program))
+    ktest_cmd.append("--ktest-arg=\"--sym-stdin\"")
+    ktest_cmd.append("--ktest-arg=\"{}\"".format(concrete_size))
+    ktest_cmd.append("--ktest-object-name=stdin")
+    ktest_cmd.append("--ktest-object-data={}".format(args.inputfile))
+    ktest_cmd.append("--ktest-object-name=stdin-stat")
+    ktest_cmd.append("--ktest-object-data={}".format(args.statd))
+    ktest_cmd.append("--ktest-object-name=model_version")
+    ktest_cmd.append("--ktest-object-data={}".format(args.modeld))
+    h,ktestfilename = mkstemp(suffix=".ktest")
+    ktest_cmd.append(ktestfilename)
+    check_call(ktest_cmd)
+    kleetestdir = mkdtemp(suffix="_klee")
+    print kleetestdir
+    klee_cmd = ["klee"]
+    klee_cmd.append("-output-dir={}/run".format(kleetestdir))
+    klee_cmd.append("--seed-out={}".format(ktestfilename))
+    klee_cmd.append("--only-replay-seeds")
+    klee_cmd.append("--write-smt2s")
+    klee_cmd.append("-libc=uclibc")
+    klee_cmd.append("-posix-runtime")
+    klee_cmd.append("-solver-backend=stp")
+    klee_cmd.append(args.program)
+    klee_cmd.append("--sym-stdin")
+    klee_cmd.append("{}".format(concrete_size))
+    check_call(klee_cmd)
+
+    shutil.copy("{}/run/test000001.smt2".format(kleetestdir), args.outputfile)
+    shutil.rmtree(kleetestdir)
+    os.remove(ktestfilename)
+    return 0
+
+if __name__ == '__main__':
+    parser = ArgumentParser("mkpathcond")
+    parser.add_argument("program", type=str)
+    parser.add_argument("statd", type=str)
+    parser.add_argument("modeld", type=str)
+    parser.add_argument("inputfile", type=str)
+    parser.add_argument("outputfile", type=str)
+    args = parser.parse_args()
+    sys.exit(main(args))
