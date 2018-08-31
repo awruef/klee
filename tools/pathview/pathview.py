@@ -177,14 +177,13 @@ def remove_casts(c):
 
 class FNodeToIntVisitor(FNodeVisitor):
   def __init__(self):
-    self.result = None
+    self.result = []
   
   def getInt(self):
     return self.result
 
   def visit_bv_constant(self, c):
-    assert self.result == None
-    self.result = c.constant_value()
+    self.result.append(c.constant_value())
 
 class IndexVisitor(FNodeVisitor):
   def __init__(self, s):
@@ -198,7 +197,8 @@ class IndexVisitor(FNodeVisitor):
     v = FNodeToIntVisitor()
     v.visit(index)
     idx = v.getInt()
-    self.s.add(idx)
+    if len(idx) == 1:
+      self.s.add(idx[0])
 
 class FNodeReplaceArrayCasts(FNodeVisitor):
   class FNodeGetExt(FNodeVisitor):
