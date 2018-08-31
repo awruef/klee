@@ -1,6 +1,7 @@
 #!/usr/bin/env python2
 from pysmt.smtlib.parser import SmtLibParser
 from pysmt.operators import op_to_str
+from pysmt.exceptions import PysmtTypeError
 from six.moves import cStringIO
 from multiprocessing import Pool
 import argparse
@@ -335,7 +336,18 @@ def main(args):
     for s in subs:
       new_stdin_conjs = []
       for c in stdin_conjs:
-        a = c.substitute(s)
+        # Stupid: Try substitutions one by one, skip those that don't type check.
+        # It should concern you that we try to make substitutions that don't type
+        # check. Don't worry about it for now. 
+        cp = c
+        for k in s.keys():
+          try:
+            cs = {}
+            cs[k] = s[k]
+            cp = cp.substitute(cs)
+          except PysmtTypeError:
+            pass
+        a = cp
         q = a.simplify()
         if reads_names(q, ["stdin"]):
           new_stdin_conjs.append(q)
