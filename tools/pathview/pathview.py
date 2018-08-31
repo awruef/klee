@@ -2,7 +2,9 @@
 from pysmt.smtlib.parser import SmtLibParser
 from pysmt.operators import op_to_str
 from six.moves import cStringIO
+from multiprocessing import Pool
 import argparse
+import copy
 import sys
 
 class FNodeVisitor(object):
@@ -18,82 +20,146 @@ class FNodeVisitor(object):
     else:
       return
 
+    c = True
     if f.is_equals():
-      self.visit_equals(f)
+      c = self.visit_equals(f)
     elif f.is_not():
-      self.visit_not(f)
+      c = self.visit_not(f)
     elif f.is_bv_constant():
-      self.visit_bv_constant(f)
+      c = self.visit_bv_constant(f)
     elif f.is_bv_extract():
-      self.visit_bv_extract(f)
+      c = self.visit_bv_extract(f)
+    elif f.is_bv_concat():
+      c = self.visit_bv_concat(f)
     elif f.is_bv_zext():
-      self.visit_bv_zext(f)
+      c = self.visit_bv_zext(f)
     elif f.is_select():
-      self.visit_select(f)
+      c = self.visit_select(f)
     elif f.is_symbol():
-      self.visit_symbol(f)
+      c = self.visit_symbol(f)
+    elif f.is_bv_urem():
+      c = self.visit_bv_urem(f)
     elif f.is_bv_srem():
-      self.visit_bv_srem(f)
+      c = self.visit_bv_srem(f)
     elif f.is_bv_mul():
-      self.visit_bv_mul(f)
+      c = self.visit_bv_mul(f)
     elif f.is_bv_add():
-      self.visit_bv_add(f)
+      c = self.visit_bv_add(f)
     elif f.is_bv_sext():
-      self.visit_bv_sext(f)
+      c = self.visit_bv_sext(f)
     elif f.is_bv_slt():
-      self.visit_bv_slt(f)
+      c = self.visit_bv_slt(f)
     elif f.is_bv_ult():
-      self.visit_bv_ult(f)
+      c = self.visit_bv_ult(f)
     elif f.is_bv_sle():
-      self.visit_bv_sle(f)
+      c = self.visit_bv_sle(f)
+    elif f.is_bv_ashr():
+      c = self.visit_bv_ashr(f)
+    elif f.is_bv_lshl():
+      c = self.visit_bv_lshl(f)
+    elif f.is_bv_lshr():
+      c = self.visit_bv_lshr(f)
+    elif f.is_bv_ule():
+      c = self.visit_bv_ule(f)
+    elif f.is_bv_and():
+      c = self.visit_bv_and(f)
+    elif f.is_bv_or():
+      c = self.visit_bv_or(f)
+    elif f.is_bv_udiv():
+      c = self.visit_bv_udiv(f)
+    elif f.is_bv_sub():
+      c = self.visit_bv_sub(f)
+    elif f.is_bv_sdiv():
+      c = self.visit_bv_sdiv(f)
+    elif f.is_ite():
+      c = self.visit_ite(f)
     else:
       print op_to_str(f.node_type())
       raise NotImplementedError
-    for i in f.args():
-      self._visit(i, visited)
+
+    if c == True:
+      for i in f.args():
+        self._visit(i, visited)
+    
     return    
 
+  def visit_ite(self, f):
+    return True
+
+  def visit_bv_udiv(self, f):
+    return True
+
+  def visit_bv_sdiv(self, f):
+    return True
+
+  def visit_bv_sub(self, f):
+    return True 
+ 
+  def visit_bv_or(self, f):
+    return True
+
+  def visit_bv_and(self, f):
+    return True
+
+  def visit_bv_ule(self, f):
+    return True
+
+  def visit_bv_lshr(self, f):
+    return True
+
+  def visit_bv_lshl(self, f):
+    return True
+
+  def visit_bv_ashr(self, f):
+    return True
+
   def visit_bv_sle(self, f):
-    pass
+    return True
 
   def visit_bv_ult(self, f):
-    pass
+    return True
 
   def visit_bv_slt(self, f):
-    pass
+    return True
 
   def visit_bv_sext(self, f):
-    pass
+    return True
 
   def visit_bv_add(self, f):
-    pass
+    return True
 
   def visit_bv_mul(self, f):
-    pass
+    return True
+
+  def visit_bv_urem(self, f):
+    return True
 
   def visit_bv_srem(self, f):
-    pass
+    return True
 
   def visit_symbol(self, f):
-    pass
+    return True
 
   def visit_select(self, f):
-    pass
+    return True
 
   def visit_bv_zext(self, f):
-    pass
+    return True
 
   def visit_bv_constant(self, f):
-    pass
+    return True
 
   def visit_equals(self, f):
-    pass
+    return True
 
   def visit_not(self, f):
-    pass
- 
+    return True
+
+  def visit_bv_concat(self, f):
+    return True
+
   def visit_bv_extract(self, f):
-    pass
+    return True
 
 def remove_casts(c):
   if c.is_bv_extract():
@@ -102,8 +168,78 @@ def remove_casts(c):
       return b.args()[0]
   return c
 
+class FNodeToIntVisitor(FNodeVisitor):
+  def __init__(self):
+    self.result = None
+  
+  def getInt(self):
+    return self.result
+
+  def visit_bv_constant(self, c):
+    assert self.result == None
+    self.result = c.constant_value()
+
+class IndexVisitor(FNodeVisitor):
+  def __init__(self, s):
+    self.s = s 
+
+  def getIndices(self):
+    return self.s
+ 
+  def visit_select(self, select):
+    name,index = select.args()
+    v = FNodeToIntVisitor()
+    v.visit(index)
+    idx = v.getInt()
+    self.s.add(idx)
+
+class FNodeReplaceArrayCasts(FNodeVisitor):
+  class FNodeGetExt(FNodeVisitor):
+    def __init__(self, s):
+      self.subs = s
+
+    def getSubs(self):
+      return self.subs
+
+    def _visit_gen(self, e):
+      base = e.args()[0]
+      if base.is_array_op():
+        v = IndexVisitor(set())
+        v.visit(base)
+        q = v.getIndices()
+        if len(q) == 1:
+          self.subs[e] = base
+          return False
+        else:
+          return True
+      else:
+        return True
+
+    def visit_bv_zext(self, e):
+      return self._visit_gen(e)
+
+    def visit_bv_sext(self, e):
+      return self._visit_gen(e)
+
+  def __init__(self):
+    self.results = {}
+  
+  def visit_bv_extract(self, e):
+    q = {}
+    uvv = self.FNodeGetExt(q)
+    uvv.visit(e)
+    if len(q.keys()) == 1:
+      k = q.keys()[0]
+      self.results[e] = q[k]
+    return False
+
+  def getSubs(self):
+    return self.results
+
 def find_subs(cnjs, names):
-  subs = {}
+  subs = []
+  # Phase 1
+  s1 = {}
   for c in cnjs:
     if c.is_equals():
       lhs,rhs = c.args()
@@ -111,7 +247,18 @@ def find_subs(cnjs, names):
       if rhs_c.is_array_op():
         name,idx = rhs_c.args()
         if str(name) in names:
-          subs[rhs_c] = lhs
+          s1[rhs_c] = lhs
+  subs.append(s1) 
+  # Phase 2
+  s2 = {}
+  for c in cnjs:
+      acv = FNodeReplaceArrayCasts()
+      acv.visit(c)
+      ns = acv.getSubs()
+      for k in ns.keys():
+        if k not in s1.keys() and k not in s2.keys():
+          s2[k] = ns[k]
+  subs.append(s2) 
   return subs
 
 def reads_names(f, names):
@@ -150,32 +297,6 @@ def get_conjuncts(cnjs):
 
   return v
 
-class FNodeToIntVisitor(FNodeVisitor):
-  def __init__(self):
-    self.result = None
-  
-  def getInt(self):
-    return self.result
-
-  def visit_bv_constant(self, c):
-    assert self.result == None
-    self.result = c.constant_value()
-
-class IndexVisitor(FNodeVisitor):
-
-  def __init__(self, s):
-    self.s = s 
-
-  def getIndices(self):
-    return self.s
- 
-  def visit_select(self, select):
-    name,index = select.args()
-    v = FNodeToIntVisitor()
-    v.visit(index)
-    idx = v.getInt()
-    self.s.add(idx)
-
 def get_referred_indexes(conjs, names):
   m = {}
   for c in conjs:
@@ -202,13 +323,17 @@ def main(args):
         for c in cmd.args:
           conjs.extend(get_conjuncts(c.simplify()))
 
-    s = find_subs(conjs, ["stdin", "const_arr1"])
-    stdin_conjs = []
-    for c in conjs:
-      q = c.substitute(s).simplify()
-      if reads_names(q, ["stdin"]):
-        stdin_conjs.append(q)
-    stdin_idxes = get_referred_indexes(conjs, ["stdin"]) 
+    subs = find_subs(conjs, ["stdin", "const_arr1"])
+    stdin_conjs = copy.deepcopy(conjs)
+    for s in subs:
+      new_stdin_conjs = []
+      for c in stdin_conjs:
+        a = c.substitute(s)
+        q = a.simplify()
+        if reads_names(q, ["stdin"]):
+          new_stdin_conjs.append(q)
+      stdin_conjs = new_stdin_conjs
+    stdin_idxes = get_referred_indexes(stdin_conjs, ["stdin"]) 
     ks = stdin_idxes.keys()
     ks.sort()
     for k in ks:
