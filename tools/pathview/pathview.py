@@ -9,77 +9,78 @@ import sys
 
 class FNodeVisitor(object):
 
-  def visit(self, f):
+  def visit(self, e):
     visited = set()
-    self._visit(f, visited) 
-    return
+    q = [e]
 
-  def _visit(self, f, visited):
-    if f not in visited:
+    while len(q) > 0:
+      c = True
+      f = q.pop()
       visited.add(f)
-    else:
-      return
+      if f.is_equals():
+        c = self.visit_equals(f)
+      elif f.is_store():
+        c = self.visit_store(f)
+      elif f.is_array_value():
+        c = self.visit_array_value(f)
+      elif f.is_not():
+        c = self.visit_not(f)
+      elif f.is_bv_constant():
+        c = self.visit_bv_constant(f)
+      elif f.is_bv_extract():
+        c = self.visit_bv_extract(f)
+      elif f.is_bv_concat():
+        c = self.visit_bv_concat(f)
+      elif f.is_bv_zext():
+        c = self.visit_bv_zext(f)
+      elif f.is_select():
+        c = self.visit_select(f)
+      elif f.is_symbol():
+        c = self.visit_symbol(f)
+      elif f.is_bv_urem():
+        c = self.visit_bv_urem(f)
+      elif f.is_bv_srem():
+        c = self.visit_bv_srem(f)
+      elif f.is_bv_mul():
+        c = self.visit_bv_mul(f)
+      elif f.is_bv_add():
+        c = self.visit_bv_add(f)
+      elif f.is_bv_sext():
+        c = self.visit_bv_sext(f)
+      elif f.is_bv_slt():
+        c = self.visit_bv_slt(f)
+      elif f.is_bv_ult():
+        c = self.visit_bv_ult(f)
+      elif f.is_bv_sle():
+        c = self.visit_bv_sle(f)
+      elif f.is_bv_ashr():
+        c = self.visit_bv_ashr(f)
+      elif f.is_bv_lshl():
+        c = self.visit_bv_lshl(f)
+      elif f.is_bv_lshr():
+        c = self.visit_bv_lshr(f)
+      elif f.is_bv_ule():
+        c = self.visit_bv_ule(f)
+      elif f.is_bv_and():
+        c = self.visit_bv_and(f)
+      elif f.is_bv_or():
+        c = self.visit_bv_or(f)
+      elif f.is_bv_udiv():
+        c = self.visit_bv_udiv(f)
+      elif f.is_bv_sub():
+        c = self.visit_bv_sub(f)
+      elif f.is_bv_sdiv():
+        c = self.visit_bv_sdiv(f)
+      elif f.is_ite():
+        c = self.visit_ite(f)
+      else:
+        print op_to_str(f.node_type())
+        raise NotImplementedError
 
-    c = True
-    if f.is_equals():
-      c = self.visit_equals(f)
-    elif f.is_not():
-      c = self.visit_not(f)
-    elif f.is_bv_constant():
-      c = self.visit_bv_constant(f)
-    elif f.is_bv_extract():
-      c = self.visit_bv_extract(f)
-    elif f.is_bv_concat():
-      c = self.visit_bv_concat(f)
-    elif f.is_bv_zext():
-      c = self.visit_bv_zext(f)
-    elif f.is_select():
-      c = self.visit_select(f)
-    elif f.is_symbol():
-      c = self.visit_symbol(f)
-    elif f.is_bv_urem():
-      c = self.visit_bv_urem(f)
-    elif f.is_bv_srem():
-      c = self.visit_bv_srem(f)
-    elif f.is_bv_mul():
-      c = self.visit_bv_mul(f)
-    elif f.is_bv_add():
-      c = self.visit_bv_add(f)
-    elif f.is_bv_sext():
-      c = self.visit_bv_sext(f)
-    elif f.is_bv_slt():
-      c = self.visit_bv_slt(f)
-    elif f.is_bv_ult():
-      c = self.visit_bv_ult(f)
-    elif f.is_bv_sle():
-      c = self.visit_bv_sle(f)
-    elif f.is_bv_ashr():
-      c = self.visit_bv_ashr(f)
-    elif f.is_bv_lshl():
-      c = self.visit_bv_lshl(f)
-    elif f.is_bv_lshr():
-      c = self.visit_bv_lshr(f)
-    elif f.is_bv_ule():
-      c = self.visit_bv_ule(f)
-    elif f.is_bv_and():
-      c = self.visit_bv_and(f)
-    elif f.is_bv_or():
-      c = self.visit_bv_or(f)
-    elif f.is_bv_udiv():
-      c = self.visit_bv_udiv(f)
-    elif f.is_bv_sub():
-      c = self.visit_bv_sub(f)
-    elif f.is_bv_sdiv():
-      c = self.visit_bv_sdiv(f)
-    elif f.is_ite():
-      c = self.visit_ite(f)
-    else:
-      print op_to_str(f.node_type())
-      raise NotImplementedError
-
-    if c == True:
-      for i in f.args():
-        self._visit(i, visited)
+      if c == True:
+        for i in f.args():
+          if i not in visited:
+            q.insert(0,i)
     
     return    
 
@@ -147,6 +148,12 @@ class FNodeVisitor(object):
     return True
 
   def visit_bv_constant(self, f):
+    return True
+
+  def visit_array_value(self, f):
+    return True
+
+  def visit_store(self, f):
     return True
 
   def visit_equals(self, f):
@@ -324,7 +331,7 @@ def main(args):
           conjs.extend(get_conjuncts(c.simplify()))
 
     subs = find_subs(conjs, ["stdin", "const_arr1"])
-    stdin_conjs = copy.deepcopy(conjs)
+    stdin_conjs = conjs
     for s in subs:
       new_stdin_conjs = []
       for c in stdin_conjs:
