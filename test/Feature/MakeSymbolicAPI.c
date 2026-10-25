@@ -22,7 +22,9 @@ int main() {
     // CHECK-ERR-DAG: KLEE: ERROR: {{.*}} Symbolic string pointer passed to one of the klee_ functions
 
   if (a == 4)
-    klee_make_symbolic(&c, sizeof(c) - 1, "c");
+    /* This fork deliberately supports a smaller, symbolic prefix. A request
+       larger than the containing object must still be rejected. */
+    klee_make_symbolic(&c, sizeof(c) + 1, "c");
     // CHECK-ERR-DAG: KLEE: ERROR: {{.*}} Wrong size given to klee_make_symbolic
 
   klee_make_symbolic(&b, sizeof(b));

@@ -141,6 +141,100 @@ extern "C" {
      constants and that the range lie within a single object. */
   void klee_check_memory_access(const void *address, size_t size);
 
+  /* Bounded logical-thread tracing for concurrency harnesses. These calls do
+   * not create operating-system threads. A harness supplies an explicit
+   * interleaving with klee_concurrency_set_thread(), and records the shared
+   * accesses and synchronization performed by each logical thread. Thread
+   * identifiers, sizes, site identifiers, and addresses must be concrete.
+   * A conflicting access not ordered by spawn, join, or a modeled mutex is
+   * reported as a race.err program error. */
+  void klee_concurrency_create_thread(uint64_t thread_id);
+  /* Select the active logical thread. Once klee_concurrency_schedule() has
+   * made a decision, only the scheduler may change the active thread; a
+   * direct selection of another thread is a model error. */
+  void klee_concurrency_set_thread(uint64_t thread_id);
+  /* Record that a logical thread is blocked. kind 0 is a harness-declared
+   * reason the engine cannot verify; kind 1 means the thread waits for the
+   * named modeled mutex, which must currently be owned by another thread. A
+   * blocked thread may not be selected, scheduled, or finished until
+   * klee_concurrency_unblock(). A mutex reason may be cleared only once the
+   * mutex is no longer owned by another thread. While the active declaration
+   * is LOCAL, blocking another thread or unblocking any thread is a model
+   * error, because a LOCAL transition may not change another thread's
+   * enabledness. */
+  void klee_concurrency_block(uint64_t thread_id, uint32_t kind,
+                              const void *mutex);
+  void klee_concurrency_unblock(uint64_t thread_id);
+  void klee_concurrency_finish_thread(void);
+  void klee_concurrency_join_thread(uint64_t thread_id);
+  /* Declare the next transition for a logical thread. Kinds are OPAQUE=0,
+   * LOCAL=1, READ=2, WRITE=3, and MUTEX=4. The engine checks the selected
+   * thread's traced operations against this declaration. */
+  void klee_concurrency_declare(uint64_t thread_id, uint32_t kind,
+                                const void *address, size_t size);
+  /* Trace operations used by source instrumentation. They work in both
+   * harness-driven and native pthread states. In native mode traced mutexes
+   * block, wake waiters, and create scheduling boundaries. */
+  void klee_concurrency_mutex_lock(const void *mutex);
+  void klee_concurrency_mutex_unlock(const void *mutex);
+  /* Condition-variable trace operations used by the std::condition_variable
+   * model. They require the native pthread model: a wait releases the traced
+   * mutex, blocks until notified, and reacquires it; signal wakes one waiter
+   * (forking over which) and broadcast wakes every waiter. A wait outside
+   * native mode is a model error and a notification there is a no-op. */
+  void klee_concurrency_cond_wait(const void *condition, const void *mutex);
+  void klee_concurrency_cond_signal(const void *condition);
+  void klee_concurrency_cond_broadcast(const void *condition);
+  void klee_concurrency_read(const void *address, size_t size,
+                             uint64_t site_id);
+  void klee_concurrency_write(const void *address, size_t size,
+                              uint64_t site_id);
+  /* Report that every still-live modeled thread is blocked. The mask must be
+   * concrete, must exactly name all unfinished logical threads, and every
+   * named thread must have been blocked with klee_concurrency_block(). The
+   * deadlock is reported as verified when every thread waits on a mutex held
+   * by another blocked thread, and as harness-declared otherwise. A mutex
+   * reason whose mutex is no longer owned is a model error. The active
+   * declaration is completed first, so a declared READ, WRITE, or MUTEX step
+   * that never performed its operation is reported as a model error instead
+   * of a deadlock. */
+  __attribute__((noreturn))
+  void klee_concurrency_deadlock(uint64_t blocked_mask);
+  /* Select one runnable logical thread. runnable_mask bit N represents
+   * thread N. The selected thread is choice modulo the number of candidates,
+   * preserving a caller-owned symbolic input for native replay. max_switches
+   * is a preemption bound: a selection is charged only when the previously
+   * running thread is still offered in runnable_mask and a different thread's
+   * non-LOCAL transition is selected. Switching away from a finished or
+   * blocked thread is free, and declared LOCAL transitions neither charge nor
+   * change which thread's continuation is free. The previously running thread
+   * therefore always remains a candidate, so the bound narrows the candidate
+   * set rather than terminating the path; the defensive bound-exhausted
+   * termination (`.early`, UINT64_MAX from the native shim) is retained. */
+  uint64_t klee_concurrency_schedule(uint64_t runnable_mask, uint64_t choice,
+                                     uint64_t max_switches);
+  /* Start a new harness scheduling episode: clears the preemption anchor and
+   * switch count, the switch bound, and every transition declaration. It is a
+   * model error after scheduling has begun unless exactly one logical thread
+   * remains unfinished and runnable. That coordinator becomes active and is
+   * ordered after every finished thread. Thread identifiers are not reused;
+   * the next episode must create fresh ones. The native replay shim resets
+   * its own copy of the scheduler state, so replay keeps following the engine
+   * across episodes. klee_concurrency_driver_init() calls this. */
+  void klee_concurrency_reset_scheduler(void);
+  /* Native pthread model. pthread_create, pthread_join, pthread_exit,
+   * pthread_self, pthread_equal, pthread_detach, pthread_mutex_{init,
+   * destroy,lock,trylock,unlock}, pthread_cond_{init,destroy,wait,signal,
+   * broadcast}, and sched_yield are modeled by the engine, which owns one
+   * execution context per thread and forks a scheduling decision after each
+   * of these operations within -concurrency-preemption-bound. Each decision
+   * is recorded as a one-byte `klee_sched_N` object in the test case.
+   * klee_concurrency_yield() adds a decision point at an arbitrary program
+   * location (for instrumented code); it is inert in a harness-driven state.
+   * Harness scheduling-driver intrinsics and the native model cannot be
+   * mixed in one state; the trace operations above are mode-neutral. */
+  void klee_concurrency_yield(void);
+
   /* Enable/disable forking. */
   void klee_set_forking(unsigned enable);
 

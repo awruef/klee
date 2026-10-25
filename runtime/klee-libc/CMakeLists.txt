@@ -30,6 +30,7 @@ set(SRC_FILES
         strncmp.c
         strncpy.c
         strrchr.c
+        strtod.c
         strtol.c
         strtoul.c
         tolower.c

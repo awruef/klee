@@ -72,6 +72,25 @@ StackFrame::~StackFrame() {
   delete[] locals; 
 }
 
+ThreadContext::ThreadContext(const ThreadContext &other)
+    : pc(other.pc), prevPC(other.prevPC), stack(other.stack),
+      incomingBBIndex(other.incomingBBIndex),
+      openMergeStack(other.openMergeStack),
+      unwindingInformation(other.unwindingInformation
+                               ? other.unwindingInformation->clone()
+                               : nullptr),
+      lastBusyTrylock(other.lastBusyTrylock),
+      result(other.result), finished(other.finished), detached(other.detached),
+      condPhase(other.condPhase) {}
+
+ThreadContext &ThreadContext::operator=(const ThreadContext &other) {
+  if (this == &other)
+    return *this;
+  ThreadContext copy(other);
+  *this = std::move(copy);
+  return *this;
+}
+
 /***/
 
 ExecutionState::ExecutionState(KFunction *kf, MemoryManager *mm)
@@ -88,8 +107,14 @@ ExecutionState::~ExecutionState() {
   for (const auto &cur_mergehandler: openMergeStack){
     cur_mergehandler->removeOpenState(this);
   }
+  for (const auto &entry : threadContexts) {
+    for (const auto &cur_mergehandler : entry.second.openMergeStack)
+      cur_mergehandler->removeOpenState(this);
+  }
 
   while (!stack.empty()) popFrame();
+  for (auto &entry : threadContexts)
+    unwindStack(entry.second.stack);
 }
 
 ExecutionState::ExecutionState(const ExecutionState& state):
@@ -97,7 +122,13 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     prevPC(state.prevPC),
     stack(state.stack),
     incomingBBIndex(state.incomingBBIndex),
+    threadContexts(state.threadContexts),
+    runningThread(state.runningThread),
+    nativeDecisions(state.nativeDecisions),
+    lastBusyTrylock(state.lastBusyTrylock),
     depth(state.depth),
+    interesting(state.interesting),
+    concurrency(state.concurrency),
     addressSpace(state.addressSpace),
     stackAllocator(state.stackAllocator),
     heapAllocator(state.heapAllocator),
@@ -120,6 +151,10 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     base_mos(state.base_mos) {
   for (const auto &cur_mergehandler: openMergeStack)
     cur_mergehandler->addOpenState(this);
+  for (const auto &entry : threadContexts) {
+    for (const auto &cur_mergehandler : entry.second.openMergeStack)
+      cur_mergehandler->addOpenState(this);
+  }
 }
 
 ExecutionState *ExecutionState::branch() {
@@ -129,6 +164,10 @@ ExecutionState *ExecutionState::branch() {
   falseState->setID();
   falseState->coveredNew = false;
   falseState->coveredLines.clear();
+  // A preference lease belongs to the path that called the intrinsic.  The
+  // searcher consumes the original state's lease when this fork is reported;
+  // the newly-created branch must never inherit it.
+  falseState->interesting = false;
 
   return falseState;
 }
@@ -144,6 +183,50 @@ void ExecutionState::popFrame() {
     addressSpace.unbindObject(memoryObject);
   }
   stack.pop_back();
+}
+
+void ExecutionState::unwindStack(stack_ty &frames) {
+  while (!frames.empty()) {
+    const StackFrame &sf = frames.back();
+    for (const auto *memoryObject : sf.allocas) {
+      deallocate(memoryObject);
+      addressSpace.unbindObject(memoryObject);
+    }
+    frames.pop_back();
+  }
+}
+
+ThreadContext &ExecutionState::createThreadContext(std::uint64_t thread) {
+  assert(!threadContexts.count(thread) && "thread context already exists");
+  if (!threadContexts.count(runningThread))
+    threadContexts[runningThread] = ThreadContext();
+  return threadContexts[thread];
+}
+
+void ExecutionState::switchToThread(std::uint64_t thread) {
+  if (thread == runningThread)
+    return;
+  auto target = threadContexts.find(thread);
+  assert(target != threadContexts.end() && "switch to unknown thread");
+  assert(!target->second.finished && "switch to finished thread");
+  ThreadContext &current = threadContexts[runningThread];
+  current.pc = pc;
+  current.prevPC = prevPC;
+  current.stack = std::move(stack);
+  current.incomingBBIndex = incomingBBIndex;
+  current.openMergeStack = std::move(openMergeStack);
+  current.unwindingInformation = std::move(unwindingInformation);
+  current.lastBusyTrylock = lastBusyTrylock;
+  stack.clear();
+  pc = target->second.pc;
+  prevPC = target->second.prevPC;
+  stack = std::move(target->second.stack);
+  incomingBBIndex = target->second.incomingBBIndex;
+  openMergeStack = std::move(target->second.openMergeStack);
+  unwindingInformation = std::move(target->second.unwindingInformation);
+  lastBusyTrylock = target->second.lastBusyTrylock;
+  target->second.stack.clear();
+  runningThread = thread;
 }
 
 void ExecutionState::deallocate(const MemoryObject *mo) {
@@ -192,6 +275,8 @@ bool ExecutionState::merge(const ExecutionState &b) {
     llvm::errs() << "-- attempting merge of A:" << this << " with B:" << &b
                  << "--\n";
   if (pc != b.pc)
+    return false;
+  if (!threadContexts.empty() || !b.threadContexts.empty())
     return false;
 
   // XXX is it even possible for these to differ? does it matter? probably
@@ -350,9 +435,10 @@ bool ExecutionState::merge(const ExecutionState &b) {
   return true;
 }
 
-void ExecutionState::dumpStack(llvm::raw_ostream &out) const {
+static void dumpOneStack(llvm::raw_ostream &out,
+                         const ExecutionState::stack_ty &stack,
+                         const KInstruction *target) {
   unsigned idx = 0;
-  const KInstruction *target = prevPC;
   for (ExecutionState::stack_ty::const_reverse_iterator
          it = stack.rbegin(), ie = stack.rend();
        it != ie; ++it) {
@@ -385,6 +471,25 @@ void ExecutionState::dumpStack(llvm::raw_ostream &out) const {
       out << " at " << ii.file << ":" << ii.line;
     out << "\n";
     target = sf.caller;
+  }
+}
+
+void ExecutionState::dumpStack(llvm::raw_ostream &out) const {
+  /* A thread the engine records as blocked is labelled so even when its
+   * context is the loaded one (a deadlock is reported from a blocked
+   * thread's context). */
+  if (!threadContexts.empty())
+    out << "\tThread " << runningThread
+        << (concurrency.threadBlocked(runningThread) ? " (blocked)\n"
+                                                     : " (running)\n");
+  dumpOneStack(out, stack, prevPC);
+  for (const auto &entry : threadContexts) {
+    if (entry.first == runningThread || entry.second.finished)
+      continue;
+    out << "\tThread " << entry.first
+        << (concurrency.threadBlocked(entry.first) ? " (blocked)\n"
+                                                   : " (suspended)\n");
+    dumpOneStack(out, entry.second.stack, entry.second.prevPC);
   }
 }
 

@@ -132,6 +132,30 @@ cl::opt<bool> SingleObjectResolution(
     cl::desc("Try to resolve memory reads/writes to single objects "
              "when offsets are symbolic (default=false)"),
     cl::init(false), cl::cat(MiscCat));
+
+cl::opt<unsigned> MaxSizeConcretizations(
+    "max-size-concretizations",
+    cl::desc("Maximum number of concrete values enumerated for a symbolic "
+             "allocation size that has more than two feasible values "
+             "(default=8). When the enumeration is exhausted the state "
+             "terminates with a Model error instead of the stock "
+             "\"concretized symbolic size\" termination."),
+    cl::init(8), cl::cat(MiscCat));
+
+enum class SizeEnumStrategy { Range, Solver };
+
+cl::opt<SizeEnumStrategy> SizeEnumerationStrategy(
+    "size-enumeration-strategy",
+    cl::desc("How to enumerate concrete values for a symbolic allocation "
+             "size with more than two feasible values: 'range' computes the "
+             "feasible minimum and maximum by binary search and explores "
+             "them first, then evenly spaced interior points (default); "
+             "'solver' uses solver-picked values."),
+    cl::values(clEnumValN(SizeEnumStrategy::Range, "range",
+                          "Feasible min/max first, then evenly spaced points"),
+               clEnumValN(SizeEnumStrategy::Solver, "solver",
+                          "Solver-picked values")),
+    cl::init(SizeEnumStrategy::Range), cl::cat(MiscCat));
 } // namespace klee
 
 namespace {
@@ -335,6 +359,10 @@ cl::list<StateTerminationType> ExitOnErrorType(
                    "values for that type"),
         clEnumValN(StateTerminationType::NullableAttribute, "NullableAttribute",
                    "Violation of nullable attribute detected"),
+        clEnumValN(StateTerminationType::Race, "Race",
+                   "A logical-thread data race was detected"),
+        clEnumValN(StateTerminationType::Deadlock, "Deadlock",
+                   "A logical-thread deadlock was detected"),
         clEnumValN(StateTerminationType::User, "User",
                    "Wrong klee_* function invocation")),
     cl::ZeroOrMore,
@@ -371,6 +399,13 @@ cl::opt<bool> MaxMemoryInhibit(
         "Inhibit forking when above memory cap (see -max-memory) (default=true)"),
     cl::init(true),
     cl::cat(TerminationCat));
+
+cl::opt<unsigned> ConcurrencyPreemptionBound(
+    "concurrency-preemption-bound",
+    cl::desc("Native pthread model: maximum number of preemptions per path. "
+             "A decision is charged only when the running thread is still "
+             "runnable and another thread is selected (default=1)"),
+    cl::init(1), cl::cat(TerminationCat));
 
 cl::opt<unsigned> RuntimeMaxStackFrames(
     "max-stack-frames",
@@ -486,7 +521,6 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
       replayKTest(0), replayPath(0), usingSeeds(0),
       atMemoryLimit(false), inhibitForking(false), haltExecution(false),
       ivcEnabled(false), debugLogBuffer(debugBufferString) {
-
 
   const time::Span maxTime{MaxTime};
   if (maxTime) timers.add(
@@ -1714,9 +1748,16 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
   if (f && f->isDeclaration()) {
     switch (f->getIntrinsicID()) {
     case Intrinsic::not_intrinsic: {
+      /* For an invoke, continue at the normal destination before the call is
+       * handled. Concurrency handlers may re-point pc at prevPC so that a
+       * blocking call is re-executed when its thread resumes, or switch the
+       * state to another logical thread; a transfer after the call would
+       * overwrite whichever program counter the state then carries. */
+      if (InvokeInst *ii = dyn_cast<InvokeInst>(i))
+        transferToBasicBlock(ii->getNormalDest(), i->getParent(), state);
       // state may be destroyed by this call, cannot touch
       callExternalFunction(state, ki, kmodule->functionMap[f], arguments);
-      break;
+      return;
     }
     case Intrinsic::fabs: {
       ref<ConstantExpr> arg =
@@ -2131,7 +2172,17 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     
     if (state.stack.size() <= 1) {
       assert(!caller && "caller set on initial stack frame");
-      terminateStateOnExit(state);
+      if (state.concurrency.inNativeMode() && state.runningThread != 0) {
+        /* A native thread's start routine returned. Returning from main
+         * keeps process-exit semantics even while other threads exist. */
+        ref<Expr> threadResult = result;
+        if (isVoidReturn)
+          threadResult =
+              ConstantExpr::create(0, Context::get().getPointerWidth());
+        finishNativeThread(state, threadResult);
+      } else {
+        terminateStateOnExit(state);
+      }
     } else {
       state.popFrame();
 
@@ -4251,23 +4302,50 @@ void Executor::executeAlloc(ExecutionState &state,
 
     size = optimizer.optimizeExpr(size, true);
 
+    // Symbolic-size exploration already models allocations at or above 2 GiB
+    // as failures in the residual "huge malloc" branch. Apply the same rule
+    // to every concretized sample: range enumeration must not turn a sampled
+    // UINT64_MAX into a real host allocation and crash KLEE with bad_alloc.
+    auto executeConcreteAllocation = [&](ExecutionState &concreteState,
+                                         ref<ConstantExpr> concreteSize) {
+      if (concreteSize->getZExtValue() >= (1ULL << 31)) {
+        klee_message("NOTE: found huge malloc sample, returning 0");
+        bindLocal(target, concreteState,
+                  ConstantExpr::alloc(0, Context::get().getPointerWidth()));
+      } else {
+        executeAlloc(concreteState, concreteSize, isLocal, target, zeroMemory,
+                     reallocFrom, allocationAlignment);
+      }
+    };
+
     // Check if in seed mode, then try to replicate size from a seed
     ref<ConstantExpr> example = getValueFromSeeds(state, size);
     if (!example) {
+      solver->setTimeout(coreSolverTimeout);
       bool success = solver->getValue(state.constraints, size, example,
                                       state.queryMetaData);
-      assert(success && "FIXME: Unhandled solver failure");
-      (void)success;
+      solver->setTimeout(time::Span());
+      if (!success) {
+        terminateStateOnSolverError(
+            state, "Query timed out (symbolic allocation initial value).");
+        return;
+      }
 
       // Try and start with a small example.
       Expr::Width W = example->getWidth();
       while (example->Ugt(ConstantExpr::alloc(128, W))->isTrue()) {
         ref<ConstantExpr> tmp = example->LShr(ConstantExpr::alloc(1, W));
         bool res;
-        [[maybe_unused]] bool success =
-            solver->mayBeTrue(state.constraints, EqExpr::create(tmp, size), res,
-                              state.queryMetaData);
-        assert(success && "FIXME: Unhandled solver failure");
+        solver->setTimeout(coreSolverTimeout);
+        success = solver->mayBeTrue(state.constraints,
+                                    EqExpr::create(tmp, size), res,
+                                    state.queryMetaData);
+        solver->setTimeout(time::Span());
+        if (!success) {
+          terminateStateOnSolverError(
+              state, "Query timed out (symbolic allocation small example).");
+          return;
+        }
         if (!res)
           break;
         example = tmp;
@@ -4277,54 +4355,243 @@ void Executor::executeAlloc(ExecutionState &state,
     StatePair fixedSize =
         fork(state, EqExpr::create(example, size), true, BranchType::Alloc);
 
-    if (fixedSize.second) { 
+    ExecutionState *remaining = fixedSize.second;
+    if (remaining) {
       // Check for exactly two values
       ref<ConstantExpr> tmp;
-      bool success = solver->getValue(fixedSize.second->constraints, size, tmp,
-                                      fixedSize.second->queryMetaData);
-      assert(success && "FIXME: Unhandled solver failure");      
-      (void) success;
-      bool res;
-      success = solver->mustBeTrue(fixedSize.second->constraints,
-                                   EqExpr::create(tmp, size), res,
-                                   fixedSize.second->queryMetaData);
-      assert(success && "FIXME: Unhandled solver failure");      
-      (void) success;
-      if (res) {
-        executeAlloc(*fixedSize.second, tmp, isLocal,
-                     target, zeroMemory, reallocFrom);
-      } else {
-        // See if a *really* big value is possible. If so assume
-        // malloc will fail for it, so lets fork and return 0.
-        StatePair hugeSize =
-            fork(*fixedSize.second,
-                 UltExpr::create(
-                     ConstantExpr::alloc(1U << 31, example->getWidth()), size),
-                 true, BranchType::Alloc);
-        if (hugeSize.first) {
-          klee_message("NOTE: found huge malloc, returning 0");
-          bindLocal(target, *hugeSize.first, 
-                    ConstantExpr::alloc(0, Context::get().getPointerWidth()));
-        }
-        
-        if (hugeSize.second) {
+      solver->setTimeout(coreSolverTimeout);
+      bool success = solver->getValue(remaining->constraints, size, tmp,
+                                      remaining->queryMetaData);
+      solver->setTimeout(time::Span());
+      if (!success) {
+        terminateStateOnSolverError(
+            *remaining,
+            "Query timed out (symbolic allocation remainder value).");
+        remaining = nullptr;
+      }
 
-          std::string Str;
-          llvm::raw_string_ostream info(Str);
-          ExprPPrinter::printOne(info, "  size expr", size);
-          info << "  concretization : " << example << "\n";
-          info << "  unbound example: " << tmp << "\n";
-          terminateStateOnProgramError(*hugeSize.second,
-                                       "concretized symbolic size",
-                                       StateTerminationType::Model, info.str());
+      bool res = false;
+      if (remaining) {
+        solver->setTimeout(coreSolverTimeout);
+        success = solver->mustBeTrue(remaining->constraints,
+                                     EqExpr::create(tmp, size), res,
+                                     remaining->queryMetaData);
+        solver->setTimeout(time::Span());
+        if (!success) {
+          terminateStateOnSolverError(
+              *remaining,
+              "Query timed out (symbolic allocation remainder check).");
+          remaining = nullptr;
+        }
+      }
+
+      if (remaining && res) {
+        executeConcreteAllocation(*remaining, tmp);
+      } else if (remaining) {
+        // More than two feasible values: enumerate up to
+        // --max-size-concretizations concrete sizes and explore each
+        // concretely, instead of the stock "concretized symbolic size"
+        // termination. With --size-enumeration-strategy=range (default)
+        // the feasible minimum and maximum are enumerated first, then
+        // evenly spaced interior points; remaining slots fall back to
+        // solver-picked values. The remainder state keeps the stock
+        // huge-size handling and then reports the enumeration cut.
+        ExecutionState *cur = remaining;
+        unsigned enumerated = 0;
+
+        if (SizeEnumerationStrategy == SizeEnumStrategy::Range) {
+          ref<ConstantExpr> loCE, hiCE;
+          if (computeFeasibleRange(*cur, size, size->getWidth(), loCE,
+                                   hiCE)) {
+            uint64_t lo = loCE->getZExtValue();
+            uint64_t hi = hiCE->getZExtValue();
+            std::vector<ref<ConstantExpr>> candidates;
+            candidates.push_back(loCE);
+            if (hi != lo)
+              candidates.push_back(hiCE);
+            if (hi - lo >= 4) {
+              for (unsigned q = 1; q <= 3; ++q) {
+                uint64_t mid = lo + (hi - lo) / 4 * q;
+                if (mid != lo && mid != hi)
+                  candidates.push_back(
+                      ConstantExpr::alloc(mid, size->getWidth()));
+              }
+            } else {
+              for (uint64_t v = lo + 1; v < hi; ++v)
+                candidates.push_back(
+                    ConstantExpr::alloc(v, size->getWidth()));
+            }
+            if (getenv("KLEE_DEBUG_ENUM")) {
+              std::string Str;
+              llvm::raw_string_ostream os(Str);
+              os << "size-enum range: lo=" << lo << " hi=" << hi << " candidates:";
+              for (const ref<ConstantExpr> &v : candidates)
+                os << " " << v->getZExtValue();
+              os << "\n";
+              klee_message("%s", os.str().c_str());
+            }
+            // Range samples can fall into holes in a non-contiguous domain.
+            // Such samples must not consume the concrete-value budget.
+            for (const ref<ConstantExpr> &v : candidates) {
+              if (!cur || enumerated >= MaxSizeConcretizations)
+                break;
+              bool feasible;
+              solver->setTimeout(coreSolverTimeout);
+              bool success = solver->mayBeTrue(
+                  cur->constraints, EqExpr::create(v, size), feasible,
+                  cur->queryMetaData);
+              solver->setTimeout(time::Span());
+              if (!success) {
+                terminateStateOnSolverError(
+                    *cur, "Query timed out (symbolic allocation candidate).");
+                cur = nullptr;
+                break;
+              }
+              if (!feasible)
+                continue;
+
+              StatePair concreteBranch =
+                  fork(*cur, EqExpr::create(v, size), true, BranchType::Alloc);
+              if (concreteBranch.first) {
+                executeConcreteAllocation(*concreteBranch.first, v);
+              }
+              cur = concreteBranch.second;
+              ++enumerated;
+            }
+          } else {
+            terminateStateOnSolverError(
+                *cur, "Query timed out (symbolic allocation range).");
+            cur = nullptr;
+          }
+        }
+
+        while (cur && enumerated < MaxSizeConcretizations) {
+          // Ask for a value in the remainder instead of reusing `tmp`: a
+          // range candidate may already have removed `tmp` from this state.
+          ref<ConstantExpr> value;
+          solver->setTimeout(coreSolverTimeout);
+          bool success = solver->getValue(cur->constraints, size, value,
+                                          cur->queryMetaData);
+          solver->setTimeout(time::Span());
+          if (!success) {
+            terminateStateOnSolverError(
+                *cur, "Query timed out (symbolic allocation enumeration).");
+            cur = nullptr;
+            break;
+          }
+
+          StatePair concreteBranch =
+              fork(*cur, EqExpr::create(value, size), true, BranchType::Alloc);
+          if (concreteBranch.first) {
+            executeConcreteAllocation(*concreteBranch.first, value);
+          }
+          cur = concreteBranch.second;
+          ++enumerated;
+        }
+
+        if (cur) {
+          // See if a *really* big value is possible. If so assume
+          // malloc will fail for it, so lets fork and return 0.
+          StatePair hugeSize =
+              fork(*cur,
+                   UltExpr::create(
+                       ConstantExpr::alloc(1U << 31, example->getWidth()), size),
+                   true, BranchType::Alloc);
+          if (hugeSize.first) {
+            klee_message("NOTE: found huge malloc, returning 0");
+            bindLocal(target, *hugeSize.first,
+                      ConstantExpr::alloc(0, Context::get().getPointerWidth()));
+          }
+
+          if (hugeSize.second) {
+            std::string Str;
+            llvm::raw_string_ostream info(Str);
+            ExprPPrinter::printOne(info, "  size expr", size);
+            info << "  concretization : " << example << "\n";
+            info << "  unbound example: " << tmp << "\n";
+            info << "  enumeration limit: " << enumerated << "\n";
+            terminateStateOnProgramError(
+                *hugeSize.second, "symbolic size beyond enumeration limit",
+                StateTerminationType::Model, info.str());
+          }
         }
       }
     }
 
     if (fixedSize.first) // can be zero when fork fails
-      executeAlloc(*fixedSize.first, example, isLocal, 
-                   target, zeroMemory, reallocFrom);
+      executeConcreteAllocation(*fixedSize.first, example);
   }
+}
+
+bool Executor::computeFeasibleRange(ExecutionState &state, ref<Expr> size,
+                                    Expr::Width width,
+                                    ref<ConstantExpr> &loOut,
+                                    ref<ConstantExpr> &hiOut) {
+  uint64_t maxV = (width >= 64) ? ~0ULL : ((1ULL << width) - 1);
+
+  // feasible(size <= v)  ==  !(size > v is always true)
+  auto feasibleUle = [&](uint64_t v, bool &feasible) -> bool {
+    bool res;
+    solver->setTimeout(coreSolverTimeout);
+    bool success = solver->mustBeTrue(
+        state.constraints,
+        UgtExpr::create(size, ConstantExpr::alloc(v, width)), res,
+        state.queryMetaData);
+    solver->setTimeout(time::Span());
+    if (!success)
+      return false;
+    feasible = !res;
+    return true;
+  };
+  // feasible(size >= v)  ==  !(size < v is always true)
+  auto feasibleUge = [&](uint64_t v, bool &feasible) -> bool {
+    bool res;
+    solver->setTimeout(coreSolverTimeout);
+    bool success = solver->mustBeTrue(
+        state.constraints,
+        UltExpr::create(size, ConstantExpr::alloc(v, width)), res,
+        state.queryMetaData);
+    solver->setTimeout(time::Span());
+    if (!success)
+      return false;
+    feasible = !res;
+    return true;
+  };
+
+  // smallest v with feasible(size <= v) is min(size)
+  uint64_t lo = 0, hi = maxV;
+  bool f;
+  if (!feasibleUle(maxV, f) || !f)
+    return false;   // empty domain (should not happen) or solver failure
+  while (lo < hi) {
+    uint64_t mid = lo + (hi - lo) / 2;
+    bool feasible;
+    if (!feasibleUle(mid, feasible))
+      return false;
+    if (feasible)
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+
+  // largest v with feasible(size >= v) is max(size)
+  uint64_t lo2 = lo, hi2 = maxV;
+  while (lo2 < hi2) {
+    // Upper midpoint without overflowing when the interval is [0, UINT64_MAX].
+    const uint64_t delta = hi2 - lo2;
+    uint64_t mid = lo2 + delta / 2 + delta % 2;
+    bool feasible;
+    if (!feasibleUge(mid, feasible))
+      return false;
+    if (feasible)
+      lo2 = mid;
+    else
+      hi2 = mid - 1;
+  }
+
+  loOut = ConstantExpr::alloc(lo, width);
+  hiOut = ConstantExpr::alloc(lo2, width);
+  return true;
 }
 
 void Executor::executeFree(ExecutionState &state,
@@ -4618,7 +4885,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
     const Array *array = arrayCache.CreateArray(uniqueName, mo->size);
     bindObjectInState(state, mo, false, array);
     state.addSymbolic(mo, array);
-    
+
     auto found = seedMap.find(&state);
     if (found != seedMap.end()) {
       // In seed mode we need to add this as binding
@@ -4671,6 +4938,47 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
       }
     }
   }
+}
+
+void Executor::executeMakeSymbolic(ExecutionState &state,
+                                   const MemoryObject *mo,
+                                   const std::string &name, uint64_t size) {
+  // Prefix symbolication: only the first `size` bytes become symbolic;
+  // bytes beyond keep their current contents. Seeding is not supported for
+  // prefix symbolication (unused in replay-free runs).
+  assert(size < mo->size && "prefix symbolication requires size < mo->size");
+
+  // A zero-byte prefix is a no-op. In particular, do not create an empty
+  // symbolic Array or replace the object's initialized contents.
+  if (size == 0)
+    return;
+
+  if (usingSeeds)
+    klee_error("prefix symbolication does not support seeding");
+  if (replayKTest)
+    klee_error("prefix symbolication does not support KTest replay");
+
+  if (mo->size > UINT32_MAX) {
+    terminateStateOnExecError(
+        state, "Symbolic objects larger than 4 GiB are not allowed "
+               "(requested " + llvm::utostr(mo->size) + " bytes).");
+    return;
+  }
+
+  unsigned id = 0;
+  std::string uniqueName = name;
+  while (!state.arrayNames.insert(uniqueName).second) {
+    uniqueName = name + "_" + llvm::utostr(++id);
+  }
+  const Array *array = arrayCache.CreateArray(uniqueName, size);
+
+  const ObjectState *old = state.addressSpace.findObject(mo);
+  assert(old && "prefix symbolication requires a bound object");
+  ObjectState *os = state.addressSpace.getWriteable(mo, old);
+  UpdateList ul(array, 0);
+  for (uint64_t i = 0; i < size; i++)
+    os->write(i, ReadExpr::create(ul, ConstantExpr::create(i, Expr::Int32)));
+  state.addSymbolic(mo, array);
 }
 
 /***/
@@ -4822,6 +5130,210 @@ void Executor::getConstraintLog(const ExecutionState &state, std::string &res,
 
   default:
     klee_warning("Executor::getConstraintLog() : Log format not supported!");
+  }
+}
+
+/***/
+
+bool Executor::startNativeThread(ExecutionState &state, llvm::Function *start,
+                                 ref<Expr> argument, std::uint64_t &thread) {
+  KFunction *kf = kmodule->functionMap[start];
+  if (!kf) {
+    terminateStateOnExecError(state, "pthread_create: start routine has no body");
+    return false;
+  }
+  std::string error;
+  if (!state.concurrency.allocateNativeThread(thread, error) ||
+      !state.concurrency.createThread(thread, error)) {
+    terminateStateOnProgramError(state, "concurrency model error: " + error,
+                                 StateTerminationType::Model);
+    return false;
+  }
+  ThreadContext &context = state.createThreadContext(thread);
+  context.pc = kf->instructions;
+  context.prevPC = context.pc;
+  context.incomingBBIndex = 0;
+
+  const std::uint64_t parent = state.runningThread;
+  state.switchToThread(thread);
+  state.pushFrame(nullptr, kf);
+  if (statsTracker)
+    statsTracker->framePushed(state, nullptr);
+  if (start->arg_size() >= 1)
+    bindArgument(kf, 0, state, argument);
+  state.switchToThread(parent);
+  return true;
+}
+
+void Executor::finishNativeThread(ExecutionState &state, ref<Expr> result) {
+  const std::uint64_t thread = state.runningThread;
+  std::string error;
+  if (!state.concurrency.finishThread(error)) {
+    terminateStateOnProgramError(state, "concurrency model error: " + error,
+                                 StateTerminationType::Model);
+    return;
+  }
+  while (!state.stack.empty())
+    state.popFrame();
+  ThreadContext &context = state.threadContext(thread);
+  context.finished = true;
+  context.result = result;
+
+  /* The finished context has no frames. Load another unfinished context
+   * first so any diagnostic produced below has a stack to report. */
+  const std::uint64_t unfinished = state.concurrency.unfinishedMask();
+  if (unfinished != 0) {
+    std::uint64_t victim = 0;
+    while ((unfinished & (std::uint64_t{1} << victim)) == 0)
+      ++victim;
+    state.switchToThread(victim);
+  }
+
+  std::vector<std::uint64_t> joiners;
+  state.concurrency.collectBlocked(ConcurrencyBlockKind::Join, thread, 0,
+                                   joiners);
+  for (std::uint64_t joiner : joiners) {
+    if (!state.concurrency.unblockThread(joiner, error)) {
+      terminateStateOnProgramError(state, "concurrency model error: " + error,
+                                   StateTerminationType::Model);
+      return;
+    }
+  }
+  scheduleNativeThreads(state);
+}
+
+bool Executor::branchOnScheduleChoice(ExecutionState &state, std::size_t count,
+                                      std::vector<ExecutionState *> &result) {
+  result.clear();
+  assert(count >= 2 && "schedule choice needs at least two alternatives");
+  const std::string name =
+      "klee_sched_" + llvm::utostr(state.nativeDecisions++);
+  MemoryObject *mo = memory->allocate(
+      1, false, false, &state, state.prevPC ? state.prevPC->inst : nullptr, 1);
+  if (!mo) {
+    terminateStateOnExecError(state, "out of memory (schedule choice)");
+    return false;
+  }
+  mo->setName(name);
+  if (replayKTest) {
+    /* Pre-check what executeMakeSymbolic would reject, so a terminated
+     * state is never touched afterwards. */
+    if (replayPosition >= replayKTest->numObjects) {
+      terminateStateOnUserError(state, "replay count mismatch");
+      return false;
+    }
+    if (replayKTest->objects[replayPosition].numBytes != 1) {
+      terminateStateOnUserError(state, "replay size mismatch");
+      return false;
+    }
+  }
+  executeMakeSymbolic(state, mo, name);
+  const ObjectState *os = state.addressSpace.findObject(mo);
+  assert(os && "schedule choice object is not bound");
+  ref<Expr> choice = os->read8(0);
+  ref<Expr> ordinal =
+      URemExpr::create(choice, ConstantExpr::create(count, Expr::Int8));
+  if (auto *selected = dyn_cast<ConstantExpr>(ordinal)) {
+    /* KTest replay bound the byte to its recorded value: exactly one
+     * alternative is feasible, and Executor::branch must not be asked to
+     * add the constant-false conditions of the others. */
+    result.assign(count, nullptr);
+    result[selected->getZExtValue()] = &state;
+    return true;
+  }
+  std::vector<ref<Expr>> conditions;
+  for (std::size_t index = 0; index < count; ++index)
+    conditions.push_back(
+        EqExpr::create(ordinal, ConstantExpr::create(index, Expr::Int8)));
+  branch(state, conditions, result, BranchType::Schedule);
+  return true;
+}
+
+void Executor::scheduleNativeThreads(ExecutionState &state,
+                                     NativeBoundary boundary) {
+  std::string error;
+  switch (boundary) {
+  case NativeBoundary::Operation:
+    state.concurrency.clearYielded();
+    break;
+  case NativeBoundary::Yield:
+    state.concurrency.markYielded(state.runningThread);
+    break;
+  case NativeBoundary::Preemption:
+    break;
+  }
+  const std::uint64_t runnable = state.concurrency.runnableMask();
+  if (runnable == 0) {
+    const std::uint64_t unfinished = state.concurrency.unfinishedMask();
+    if (unfinished == 0) {
+      terminateStateOnExit(state);
+      return;
+    }
+    bool verified = false;
+    if (!state.concurrency.validateDeadlock(unfinished, verified, error)) {
+      terminateStateOnProgramError(state, "concurrency model error: " + error,
+                                   StateTerminationType::Model);
+      return;
+    }
+    std::ostringstream message;
+    message << "logical-thread deadlock: blocked mask 0x" << std::hex
+            << unfinished << std::dec
+            << (verified ? "; verified: every blocked thread waits on a "
+                           "mutex, join, or condition that no runnable "
+                           "thread can release"
+                         : "; harness-declared: at least one blocking "
+                           "reason is not engine-verified");
+    terminateStateOnProgramError(state, message.str(),
+                                 StateTerminationType::Deadlock);
+    return;
+  }
+
+  /* Yield fairness: a thread that asked to be descheduled is offered only
+   * when nothing else is runnable. Removing it from the offered mask also
+   * makes the switch away from it free, since the anchor is then not
+   * offered. If every runnable thread has yielded, they all become eligible
+   * again so a one-off yield or a genuine mutual spin keeps executing. */
+  std::uint64_t eligible = runnable & ~state.concurrency.yieldedThreads();
+  if (eligible == 0) {
+    /* The running thread reached this boundary voluntarily. Re-enabling it
+     * for a new fairness round must not turn a switch to another yielder into
+     * a charged preemption. */
+    state.concurrency.waiveAnchorPreemption();
+    state.concurrency.clearYielded();
+    eligible = runnable;
+  }
+  std::vector<std::uint64_t> candidates;
+  if (!state.concurrency.scheduleCandidates(
+          eligible, ConcurrencyPreemptionBound, candidates, error)) {
+    terminateStateOnProgramError(state, "concurrency model error: " + error,
+                                 StateTerminationType::Model);
+    return;
+  }
+  if (candidates.empty()) {
+    terminateStateOnExecError(state,
+                              "native scheduler produced no candidate");
+    return;
+  }
+
+  std::vector<ExecutionState *> branches;
+  if (candidates.size() == 1) {
+    branches.push_back(&state);
+  } else if (!branchOnScheduleChoice(state, candidates.size(), branches)) {
+    return;
+  }
+  for (std::size_t index = 0; index < branches.size(); ++index) {
+    ExecutionState *branch = branches[index];
+    if (!branch)
+      continue;
+    if (!branch->concurrency.scheduleThread(candidates[index], eligible,
+                                            ConcurrencyPreemptionBound,
+                                            error)) {
+      terminateStateOnProgramError(*branch,
+                                   "concurrency model error: " + error,
+                                   StateTerminationType::Model);
+      continue;
+    }
+    branch->switchToThread(candidates[index]);
   }
 }
 

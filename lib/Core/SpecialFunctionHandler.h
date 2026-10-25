@@ -12,6 +12,7 @@
 
 #include "klee/Config/config.h"
 
+#include <cstdint>
 #include <map>
 #include <vector>
 #include <string>
@@ -71,6 +72,38 @@ namespace klee {
     /* Convenience routines */
 
     std::string readStringAtAddress(ExecutionState &state, ref<Expr> address);
+    bool getConcreteConcurrencyLocation(ExecutionState &state,
+                                        ref<Expr> argument, const char *name,
+                                        std::uint64_t &object,
+                                        std::uint64_t &offset);
+    void handleConcurrencyAccess(ExecutionState &state,
+                                 std::vector<ref<Expr>> &arguments,
+                                 bool write);
+    /* Scheduling-interface gates: a state is driven either by the harness
+     * intrinsics or by the native pthread model, never both. */
+    bool enterHarnessScheduling(ExecutionState &state, const char *name);
+    bool enterNativeThreads(ExecutionState &state, const char *name,
+                            bool preserveBusyTrylock = false);
+    bool getConcreteThreadId(ExecutionState &state, ref<Expr> argument,
+                             const char *name, std::uint64_t &thread);
+    bool writeConcreteWord(ExecutionState &state, ref<Expr> address,
+                           ref<Expr> value, const char *name);
+    void reportModelError(ExecutionState &state, const std::string &error);
+    /* Re-execute the blocking call once the thread is resumed, then hand
+     * control to the scheduler. */
+    void blockAndReschedule(ExecutionState &state);
+    /* Shared pthread/trace condition-variable protocol. bindResult binds
+     * the pthread int return value; the trace intrinsics return void. */
+    void conditionWait(ExecutionState &state, KInstruction *target,
+                       const char *name, std::uint64_t condObject,
+                       std::uint64_t condOffset, std::uint64_t mutexObject,
+                       std::uint64_t mutexOffset, bool bindResult);
+    void conditionSignal(ExecutionState &state, KInstruction *target,
+                         std::uint64_t object, std::uint64_t offset,
+                         bool bindResult, bool mergeNotifierClock);
+    void conditionBroadcast(ExecutionState &state, KInstruction *target,
+                            std::uint64_t object, std::uint64_t offset,
+                            bool bindResult, bool mergeNotifierClock);
     
     /* Handlers */
 
@@ -83,6 +116,41 @@ namespace klee {
     HANDLER(handleAssume);
     HANDLER(handleCalloc);
     HANDLER(handleCheckMemoryAccess);
+    HANDLER(handleConcurrencyBlock);
+    HANDLER(handleConcurrencyCondBroadcast);
+    HANDLER(handleConcurrencyCondSignal);
+    HANDLER(handleConcurrencyCondWait);
+    HANDLER(handleConcurrencyCreateThread);
+    HANDLER(handleConcurrencyDeclare);
+    HANDLER(handleConcurrencyDeadlock);
+    HANDLER(handleConcurrencyFinishThread);
+    HANDLER(handleConcurrencyJoinThread);
+    HANDLER(handleConcurrencyMutexLock);
+    HANDLER(handleConcurrencyMutexUnlock);
+    HANDLER(handleConcurrencyRead);
+    HANDLER(handleConcurrencyResetScheduler);
+    HANDLER(handleConcurrencySchedule);
+    HANDLER(handleConcurrencySetThread);
+    HANDLER(handleConcurrencyUnblock);
+    HANDLER(handleConcurrencyWrite);
+    HANDLER(handleConcurrencyYield);
+    HANDLER(handlePthreadCondBroadcast);
+    HANDLER(handlePthreadCondDestroy);
+    HANDLER(handlePthreadCondInit);
+    HANDLER(handlePthreadCondSignal);
+    HANDLER(handlePthreadCondWait);
+    HANDLER(handlePthreadCreate);
+    HANDLER(handlePthreadDetach);
+    HANDLER(handlePthreadEqual);
+    HANDLER(handlePthreadExit);
+    HANDLER(handlePthreadJoin);
+    HANDLER(handlePthreadMutexDestroy);
+    HANDLER(handlePthreadMutexInit);
+    HANDLER(handlePthreadMutexLock);
+    HANDLER(handlePthreadMutexTrylock);
+    HANDLER(handlePthreadMutexUnlock);
+    HANDLER(handlePthreadSelf);
+    HANDLER(handleSchedYield);
     HANDLER(handleDefineFixedObject);
     HANDLER(handleDelete);    
     HANDLER(handleDeleteArray);
@@ -101,6 +169,7 @@ namespace klee {
     HANDLER(handleMalloc);
     HANDLER(handleMemalign);
     HANDLER(handleMarkGlobal);
+    HANDLER(handleMarkInteresting);
     HANDLER(handleOpenMerge);
     HANDLER(handleCloseMerge);
     HANDLER(handleNew);

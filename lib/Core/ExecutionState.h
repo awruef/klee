@@ -11,6 +11,7 @@
 #define KLEE_EXECUTIONSTATE_H
 
 #include "AddressSpace.h"
+#include "Concurrency.h"
 #include "MemoryManager.h"
 #include "MergeHandler.h"
 
@@ -146,6 +147,40 @@ struct CleanupPhaseUnwindingInformation : public UnwindingInformation {
 };
 
 /// @brief ExecutionState representing a path under exploration
+/// Saved execution context of one native (pthread-model) logical thread. The
+/// running thread's context lives in the ExecutionState fields; a switch
+/// saves them here and loads the target's. Finished threads keep their entry
+/// so pthread_join can read the result.
+struct ThreadContext {
+  KInstIterator pc;
+  KInstIterator prevPC;
+  std::vector<StackFrame> stack;
+  std::uint32_t incomingBBIndex = 0;
+  /// Per-thread path-merge and C++ exception state. These are control-flow
+  /// stacks just like `stack`; leaving either on ExecutionState across a
+  /// logical context switch lets one pthread consume another's region or
+  /// unwinding phase.
+  std::vector<ref<MergeHandler>> openMergeStack;
+  std::unique_ptr<UnwindingInformation> unwindingInformation;
+  /// Last pthread_mutex_trylock call site that returned EBUSY. The first
+  /// failure at a site preserves the caller continuation; a consecutive
+  /// retry may invoke scheduler fairness without losing that first path.
+  KInstruction *lastBusyTrylock = nullptr;
+  /// Return value of the start routine or pthread_exit argument.
+  ref<Expr> result;
+  bool finished = false;
+  bool detached = false;
+  /// pthread_cond_wait progress: 0 = not waiting, 1 = woken and reacquiring
+  /// the mutex (the call instruction is re-executed until the lock succeeds).
+  std::uint32_t condPhase = 0;
+
+  ThreadContext() = default;
+  ThreadContext(const ThreadContext &other);
+  ThreadContext &operator=(const ThreadContext &other);
+  ThreadContext(ThreadContext &&) noexcept = default;
+  ThreadContext &operator=(ThreadContext &&) noexcept = default;
+};
+
 class ExecutionState {
 #ifdef KLEE_UNITTEST
 public:
@@ -176,8 +211,35 @@ public:
 
   // Overall state of the state - Data specific
 
+  /// @brief Native thread contexts keyed by logical thread id. Entry 0 is
+  /// the main thread. The entry of the running thread holds only its
+  /// bookkeeping fields; its pc/stack are the ExecutionState fields.
+  std::map<std::uint64_t, ThreadContext> threadContexts;
+
+  /// @brief Logical thread whose context is currently loaded.
+  std::uint64_t runningThread = 0;
+
+  /// @brief Number of engine-generated schedule choice objects so far; names
+  /// the next `klee_sched_N` symbolic in this state's test case.
+  std::uint32_t nativeDecisions = 0;
+
+  /// Running thread's retry-fairness state. Suspended values live in the
+  /// corresponding ThreadContext and move with the rest of the context.
+  KInstruction *lastBusyTrylock = nullptr;
+
   /// @brief Exploration depth, i.e., number of times KLEE branched for this state
   std::uint32_t depth = 0;
+
+  /// @brief One-shot preference lease set by klee_mark_interesting.
+  ///
+  /// The preferring searcher keeps the state preferred until its next fork,
+  /// then clears the lease so neither branch inherits an open-ended priority.
+  bool interesting = false;
+
+  /// @brief Explicit logical-thread trace and happens-before state used by
+  /// bounded concurrency harnesses. It is copied when the symbolic state
+  /// forks, just like the address space and path constraints.
+  ConcurrencyState concurrency;
 
   /// @brief Address space used by this state (e.g. Global and Heap)
   AddressSpace addressSpace;
@@ -275,6 +337,20 @@ public:
 
   void pushFrame(KInstIterator caller, KFunction *kf);
   void popFrame();
+  /// Pop every frame of the given stack, releasing its allocas.
+  void unwindStack(stack_ty &frames);
+
+  /// Native thread contexts. createThreadContext registers an empty context;
+  /// the caller then switches to it and pushes the start frame.
+  ThreadContext &createThreadContext(std::uint64_t thread);
+  bool hasThreadContext(std::uint64_t thread) const {
+    return threadContexts.count(thread) != 0;
+  }
+  ThreadContext &threadContext(std::uint64_t thread) {
+    return threadContexts[thread];
+  }
+  /// Save the running context and load another unfinished one.
+  void switchToThread(std::uint64_t thread);
 
   void deallocate(const MemoryObject *mo);
 

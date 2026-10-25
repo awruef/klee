@@ -8,10 +8,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "UserSearcher.h"
+#include <memory>
 
 #include "Executor.h"
 #include "MergeHandler.h"
 #include "Searcher.h"
+#include <algorithm>
+#include <memory>
 
 #include "klee/Support/ErrorHandling.h"
 
@@ -47,7 +50,12 @@ cl::list<Searcher::CoreSearchType> CoreSearch(
                    "use NURS with Instr-Count"),
         clEnumValN(Searcher::NURS_CPICnt, "nurs:cpicnt",
                    "use NURS with CallPath-Instr-Count"),
-        clEnumValN(Searcher::NURS_QC, "nurs:qc", "use NURS with Query-Cost")),
+        clEnumValN(Searcher::NURS_QC, "nurs:qc", "use NURS with Query-Cost"),
+        clEnumValN(Searcher::PrefDFS, "pref:dfs",
+                   "prefer klee_mark_interesting-marked states (DFS within)"),
+        clEnumValN(Searcher::PrefRP, "pref:rp",
+                   "prefer klee_mark_interesting-marked states (random-path "
+                   "within the rest)")),
     cl::cat(SearchCat));
 
 cl::opt<bool> UseIterativeDeepeningTimeSearch(
@@ -101,7 +109,8 @@ bool userSearcherRequiresMD2U() {
 }
 
 bool userSearcherRequiresInMemoryExecutionTree() {
-  return std::find(CoreSearch.begin(), CoreSearch.end(), Searcher::RandomPath) != CoreSearch.end();
+  return std::find(CoreSearch.begin(), CoreSearch.end(), Searcher::RandomPath) != CoreSearch.end() ||
+         std::find(CoreSearch.begin(), CoreSearch.end(), Searcher::PrefRP) != CoreSearch.end();
 }
 
 } // namespace klee
@@ -121,6 +130,14 @@ Searcher *getNewSearcher(Searcher::CoreSearchType type, RNG &rng,
     case Searcher::NURS_ICnt: searcher = new WeightedRandomSearcher(WeightedRandomSearcher::InstCount, rng); break;
     case Searcher::NURS_CPICnt: searcher = new WeightedRandomSearcher(WeightedRandomSearcher::CPInstCount, rng); break;
     case Searcher::NURS_QC: searcher = new WeightedRandomSearcher(WeightedRandomSearcher::QueryCost, rng); break;
+    case Searcher::PrefDFS:
+      searcher = new PreferringSearcher(
+          std::unique_ptr<Searcher>(new DFSSearcher()));
+      break;
+    case Searcher::PrefRP:
+      searcher = new PreferringSearcher(
+          std::unique_ptr<Searcher>(new RandomPathSearcher(executionTree, rng)));
+      break;
   }
 
   return searcher;

@@ -287,6 +287,15 @@ private:
                     const ObjectState *reallocFrom=0,
                     size_t allocationAlignment=0);
 
+  /// Compute the feasible minimum and maximum of \p size under the
+  /// state's constraints by binary search over solver queries.
+  /// Returns false on solver failure; the caller must terminate the affected
+  /// state as incomplete rather than treating a partial range as evidence.
+  bool computeFeasibleRange(ExecutionState &state, ref<Expr> size,
+                            Expr::Width width,
+                            ref<ConstantExpr> &loOut,
+                            ref<ConstantExpr> &hiOut);
+
   /// Free the given address with checking for errors. If target is
   /// given it will be bound to 0 in the resulting states (this is a
   /// convenience for realloc). Note that this function can cause the
@@ -321,6 +330,12 @@ private:
 
   void executeMakeSymbolic(ExecutionState &state, const MemoryObject *mo,
                            const std::string &name);
+
+  /// Prefix variant: symbolicate only the first \c size bytes of the object;
+  /// remaining bytes keep their current contents. A zero-byte prefix is a
+  /// no-op. Requires size < mo->size.
+  void executeMakeSymbolic(ExecutionState &state, const MemoryObject *mo,
+                           const std::string &name, uint64_t size);
 
   /// Create a new state where each input condition has been added as
   /// a constraint and return the results. The input state is included
@@ -423,6 +438,32 @@ private:
   /// Call exit handler and terminate state normally
   /// (end of execution path)
   void terminateStateOnExit(ExecutionState &state);
+
+  /// Native pthread model. Thread contexts are owned by the ExecutionState;
+  /// the engine derives the runnable set from ConcurrencyState and forks one
+  /// state per admissible selection within the preemption bound, recording
+  /// each decision as a one-byte `klee_sched_N` symbolic so the schedule is
+  /// part of the test case.
+  bool startNativeThread(ExecutionState &state, llvm::Function *start,
+                         ref<Expr> argument, std::uint64_t &thread);
+  /// The running thread's start routine returned or it called pthread_exit.
+  void finishNativeThread(ExecutionState &state, ref<Expr> result);
+  /// Kind of native scheduling boundary. Operation: a pthread operation,
+  /// block, or finish; clears every yield mark. Yield: sched_yield or a
+  /// repeated trylock EBUSY; marks the running thread yielded.
+  /// Preemption: klee_concurrency_yield; a plain preemption point that
+  /// neither marks nor clears.
+  enum class NativeBoundary { Operation, Yield, Preemption };
+  /// Make a scheduling decision. If nothing is runnable, report a deadlock
+  /// (or exit when every thread has finished).
+  void scheduleNativeThreads(ExecutionState &state,
+                             NativeBoundary boundary = NativeBoundary::Operation);
+  /// Fork \p state over \p count alternatives of one engine-owned choice
+  /// byte; result[i] is the state constrained to alternative i or null. A
+  /// choice that is already concrete (KTest replay) selects one alternative
+  /// without forking.
+  bool branchOnScheduleChoice(ExecutionState &state, std::size_t count,
+                              std::vector<ExecutionState *> &result);
 
   /// Call exit handler and terminate state early
   /// (e.g. due to state merging or memory pressure)

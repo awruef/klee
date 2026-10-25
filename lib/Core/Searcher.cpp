@@ -8,6 +8,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "Searcher.h"
+#include <algorithm>
+#include <memory>
 
 #include "CoreStats.h"
 #include "ExecutionState.h"
@@ -73,6 +75,99 @@ void DFSSearcher::printName(llvm::raw_ostream &os) {
   os << "DFSSearcher\n";
 }
 
+///
+
+PreferringSearcher::PreferringSearcher(std::unique_ptr<Searcher> child)
+    : child(std::move(child)) {}
+
+ExecutionState &PreferringSearcher::selectState() {
+  if (!interestingStates.empty() &&
+      (child->empty() || !selectChildNext)) {
+    // Rotate the preferred queue on every dispatch. A state remains in this
+    // queue only until its next fork, but it may need several instructions to
+    // reach that fork.
+    ExecutionState *state = interestingStates.front();
+    interestingStates.pop_front();
+    interestingStates.push_back(state);
+    selectChildNext = !child->empty();
+    return *state;
+  }
+  selectChildNext = false;
+  return child->selectState();
+}
+
+void PreferringSearcher::addInteresting(ExecutionState *state) {
+  if (interestingSet.insert(state).second)
+    interestingStates.push_back(state);
+}
+
+void PreferringSearcher::removeInteresting(ExecutionState *state) {
+  if (interestingSet.erase(state) == 0)
+    return;
+  const auto it =
+      std::find(interestingStates.begin(), interestingStates.end(), state);
+  assert(it != interestingStates.end() && "preferred-state index mismatch");
+  interestingStates.erase(it);
+}
+
+void PreferringSearcher::update(
+    ExecutionState *current, const std::vector<ExecutionState *> &addedStates,
+    const std::vector<ExecutionState *> &removedStates) {
+  std::vector<ExecutionState*> childAdded;
+  std::vector<ExecutionState*> childRemoved;
+
+  const bool currentWasInteresting =
+      current && interestingSet.count(current) != 0;
+  const bool currentRemoved =
+      current && std::find(removedStates.begin(), removedStates.end(),
+                           current) != removedStates.end();
+
+  // Remove terminated states from exactly the pool that owns them.
+  for (auto state : removedStates) {
+    if (interestingSet.count(state) != 0)
+      removeInteresting(state);
+    else
+      childRemoved.push_back(state);
+  }
+
+  if (current && !currentRemoved) {
+    if (!currentWasInteresting && current->interesting) {
+      // The handler marks the currently executing state, which is already in
+      // the child searcher. Move it instead of adding a duplicate membership.
+      childRemoved.push_back(current);
+      addInteresting(current);
+    } else if (currentWasInteresting &&
+               (!current->interesting || !addedStates.empty())) {
+      // A fork consumes the one-shot lease. ExecutionState::branch() already
+      // cleared the newly-created branch; clear and demote the original too.
+      current->interesting = false;
+      removeInteresting(current);
+      childAdded.push_back(current);
+    }
+  }
+
+  for (auto state : addedStates) {
+    if (state->interesting)
+      addInteresting(state);
+    else
+      childAdded.push_back(state);
+  }
+
+  // Only pass current through when the child owned it on entry. Searchers
+  // such as WeightedRandomSearcher update current in place and require that
+  // it already be present, even when this update also removes it.
+  child->update(currentWasInteresting ? nullptr : current, childAdded,
+                childRemoved);
+}
+
+bool PreferringSearcher::empty() {
+  return interestingStates.empty() && child->empty();
+}
+
+void PreferringSearcher::printName(llvm::raw_ostream &os) {
+  os << "Pref:";
+  child->printName(os);
+}
 
 ///
 

@@ -25,7 +25,8 @@
   BTYPE(Realloc, 8U)                                                           \
   BTYPE(Free, 9U)                                                              \
   BTYPE(GetVal, 10U)                                                           \
-  BMARK(END, 10U)
+  BTYPE(Schedule, 11U)                                                         \
+  BMARK(END, 11U)
 /// \endcond
 
 /** @enum BranchType
@@ -44,6 +45,7 @@
  *  | `BranchType::Realloc`           | branch caused by symbolic `realloc`ation size                                                      |
  *  | `BranchType::Free`              | branch caused by `free`ing symbolic pointer                                                        |
  *  | `BranchType::GetVal`            | branch caused by user-invoked concretization while seeding                                         |
+ *  | `BranchType::Schedule`          | branch caused by a bounded logical-thread scheduler choice                                          |
  */
 enum class BranchType : std::uint8_t {
   /// \cond DO_NOT_DOCUMENT

@@ -17,9 +17,45 @@
 
 #include "llvm/Support/raw_ostream.h"
 
+#include <memory>
+
 using namespace klee;
 
 namespace {
+
+TEST(SearcherTest, PreferringSearcherMigratesConsumesAndIsFair) {
+  auto child = std::make_unique<DFSSearcher>();
+  PreferringSearcher preferring(std::move(child));
+  ExecutionState ordinary;
+  ExecutionState marked;
+  ExecutionState forkChild;
+
+  // DFS would keep selecting the last state (`marked`). Once that current
+  // state is marked, the wrapper must move it out of DFS, not duplicate it in
+  // both pools. Fair scheduling then gives the ordinary state a turn.
+  preferring.update(nullptr, {&ordinary, &marked}, {});
+  EXPECT_EQ(&preferring.selectState(), &marked);
+
+  marked.interesting = true;
+  preferring.update(&marked, {}, {});
+  EXPECT_EQ(&preferring.selectState(), &marked);
+
+  // No fork yet: the lease is still live, but preferred work cannot starve
+  // the ordinary pool.
+  preferring.update(&marked, {}, {});
+  EXPECT_EQ(&preferring.selectState(), &ordinary);
+  preferring.update(&ordinary, {}, {});
+  EXPECT_EQ(&preferring.selectState(), &marked);
+
+  // The next fork consumes the lease for the original and the new branch.
+  preferring.update(&marked, {&forkChild}, {});
+  EXPECT_FALSE(marked.interesting);
+  EXPECT_FALSE(forkChild.interesting);
+  EXPECT_EQ(&preferring.selectState(), &forkChild);
+
+  preferring.update(&forkChild, {}, {&ordinary, &marked, &forkChild});
+  EXPECT_TRUE(preferring.empty());
+}
 
 TEST(SearcherTest, RandomPath) {
   // First state

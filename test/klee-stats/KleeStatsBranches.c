@@ -81,4 +81,5 @@ two:
 
 // Check that we create branches
 // CHECK-STATS: BrConditional,BrIndirect,BrSwitch,BrCall,BrMemOp,BrResolvePointer,BrAlloc,BrRealloc,BrFree,BrGetVal
-// CHECK-STATS: 1,1,2,1,{{[1-9][0-9]*}},{{[1-9][0-9]*}},2,1,1,0
+// P2 forks each symbolic allocation over its bounded concrete sample set.
+// CHECK-STATS: 1,1,2,1,{{[1-9][0-9]*}},{{[1-9][0-9]*}},90,9,81,0

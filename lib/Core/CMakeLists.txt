@@ -8,6 +8,7 @@
 #===------------------------------------------------------------------------===#
 add_library(kleeCore
   AddressSpace.cpp
+  Concurrency.cpp
   MergeHandler.cpp
   CallPathManager.cpp
   Context.cpp

@@ -71,10 +71,35 @@ namespace klee {
       NURS_RP,
       NURS_ICnt,
       NURS_CPICnt,
-      NURS_QC
+      NURS_QC,
+      PrefDFS,
+      PrefRP
     };
   };
 
+  /// PreferringSearcher wraps a child searcher and gives a state marked by
+  /// klee_mark_interesting a one-shot preference lease through its next fork.
+  /// Preferred states are kept disjoint from the child searcher and scheduled
+  /// round-robin. When ordinary states are available, preferred and ordinary
+  /// selections alternate so neither pool can starve the other.
+  class PreferringSearcher final : public Searcher {
+    std::unique_ptr<Searcher> child;
+    std::deque<ExecutionState *> interestingStates;
+    std::set<ExecutionState *> interestingSet;
+    bool selectChildNext = false;
+
+    void addInteresting(ExecutionState *state);
+    void removeInteresting(ExecutionState *state);
+
+  public:
+    explicit PreferringSearcher(std::unique_ptr<Searcher> child);
+    ExecutionState &selectState() override;
+    void update(ExecutionState *current,
+                const std::vector<ExecutionState *> &addedStates,
+                const std::vector<ExecutionState *> &removedStates) override;
+    bool empty() override;
+    void printName(llvm::raw_ostream &os) override;
+  };
   /// DFSSearcher implements depth-first exploration. All states are kept in
   /// insertion order. The last state is selected for further exploration.
   class DFSSearcher final : public Searcher {
